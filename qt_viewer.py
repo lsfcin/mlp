@@ -2,7 +2,7 @@ from typing import Dict, Any, List, Optional
 from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem, QGraphicsPolygonItem,
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QSpinBox, QLabel, QFrame, QMessageBox, QLineEdit, QComboBox, QDoubleSpinBox
+    QSpinBox, QLabel, QFrame, QMessageBox, QLineEdit, QComboBox, QDoubleSpinBox, QPlainTextEdit
 )
 from PyQt6.QtGui import QBrush, QPen, QColor, QTransform, QPainter, QPolygonF
 from PyQt6.QtCore import Qt, QPointF, QTimer
@@ -47,6 +47,7 @@ class GraphNodeItem(QGraphicsEllipseItem):
 class GraphEdgeItem(QGraphicsLineItem):
     def __init__(self, src: Dict[str, Any], dst: Dict[str, Any], edge: Dict[str, Any]):
         super().__init__(src['x'], src['y'], dst['x'], dst['y'])
+        self.edge_id = edge['id']
         pen = QPen(QColor(edge['color']))
         pen.setWidthF(max(0.5, edge['width']))
         self.setPen(pen)
@@ -221,6 +222,8 @@ class NetworkViewerWindow(QMainWindow):
         self._refresh()
         self._dataset_loaded = False
         self._current_target = None
+        self._loss_history: List[float] = []
+        self._loss_window = None  # lazy
 
     def _build_ui(self):
         root = QWidget()
@@ -355,8 +358,10 @@ class NetworkViewerWindow(QMainWindow):
         self.btn_train_step.clicked.connect(self._on_train_step)
         self.btn_train_epoch.clicked.connect(self._on_train_epoch)
 
+        self.btn_show_loss = QPushButton('Ver Loss')
+        self.btn_show_loss.clicked.connect(self._on_show_loss)
+        side.addWidget(self.btn_show_loss)
         side.addStretch(1)
-
         self.setCentralWidget(root)
 
     def _section_label(self, text: str) -> QLabel:
@@ -643,6 +648,45 @@ class NetworkViewerWindow(QMainWindow):
         self.scene.build(self.network)
         # recolor outputs conforme estado atual
         self._update_node_colors()
+        # se houver gradientes armazenados, aplicar overlay visual temporário
+        self._apply_gradient_overlay()
+
+    def _apply_gradient_overlay(self):
+        grads = getattr(self.network, 'last_gradients', None)
+        if not grads:
+            return
+        # normalizar magnitude
+        mags = [abs(g) for g in grads.values()]
+        max_mag = max(mags) if mags else 0.0
+        if max_mag <= 0:
+            return
+        for edge_item in getattr(self.scene, 'edge_items', []):
+            gid = getattr(edge_item, 'edge_id', None)
+            if gid not in grads:
+                continue
+            g = grads[gid]
+            ratio = min(1.0, abs(g) / max_mag) if max_mag else 0.0
+            # cor: verde para grad positivo, magenta para negativo
+            if g >= 0:
+                r = int(40 + 40 * (1 - ratio))
+                gcol = int(180 + 60 * ratio)
+                b = int(60 + 40 * (1 - ratio))
+            else:
+                r = int(200 * ratio + 100 * (1 - ratio))
+                gcol = int(50 * (1 - ratio) + 30)
+                b = int(180 * ratio + 80 * (1 - ratio))
+            pen = edge_item.pen()
+            pen.setColor(QColor(r, gcol, b))
+            pen.setWidthF(pen.widthF() + 1.5)
+            edge_item.setPen(pen)
+            edge_item.arrow_item.setBrush(QBrush(pen.color()))
+        # timer para restaurar após curto intervalo
+        QTimer.singleShot(1200, self._refresh_after_gradients)
+
+    def _refresh_after_gradients(self):
+        # reconstruir cena para voltar às cores base de peso (já com pesos atualizados)
+        self.scene.build(self.network)
+        self._update_node_colors()
 
     def _on_train_step(self):
         if self._forward_started:
@@ -654,6 +698,7 @@ class NetworkViewerWindow(QMainWindow):
         x, target = sample
         lr = float(self.spin_lr.value())
         outputs, error, loss = self.network.train_step(x, target, lr)
+        self._record_loss(loss)
         self._after_weight_update_refresh()
         self.label_status.setText(f'TrainStep out={outputs[0]:.4f} target={target:.4f} erro={error:.4f} loss={loss:.5f}')
 
@@ -674,10 +719,40 @@ class NetworkViewerWindow(QMainWindow):
             pred = outputs[0]
             if (pred >= 0.5 and target >= 0.5) or (pred < 0.5 and target < 0.5):
                 correct += 1
+            self._record_loss(loss)
         avg_loss = total_loss / total if total else 0.0
         acc = correct / total if total else 0.0
         self._after_weight_update_refresh()
         self.label_status.setText(f'Época: loss_med={avg_loss:.5f} acc={acc:.3f}')
+
+    # ===== Loss History Window =====
+    def _ensure_loss_window(self):
+        if self._loss_window is None:
+            self._loss_window = QWidget()
+            self._loss_window.setWindowTitle('Histórico de Loss (últimos 200)')
+            v = QVBoxLayout(self._loss_window)
+            self.loss_text = QPlainTextEdit(); self.loss_text.setReadOnly(True)
+            v.addWidget(self.loss_text)
+            self._loss_window.resize(300, 400)
+        return self._loss_window
+
+    def _record_loss(self, value: float):
+        self._loss_history.append(value)
+        if len(self._loss_history) > 200:
+            self._loss_history = self._loss_history[-200:]
+        if self._loss_window and self._loss_window.isVisible():
+            self._update_loss_text()
+
+    def _update_loss_text(self):
+        if not hasattr(self, 'loss_text'):
+            return
+        lines = [f"{i:03d}: {v:.6f}" for i, v in enumerate(self._loss_history[-200:])]
+        self.loss_text.setPlainText('\n'.join(lines))
+
+    def _on_show_loss(self):
+        win = self._ensure_loss_window()
+        self._update_loss_text()
+        win.show()
 
 
 def launch_qt_viewer():

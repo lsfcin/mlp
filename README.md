@@ -14,15 +14,17 @@ Projeto didático para aulas introdutórias de Inteligência Artificial. A ideia
 - Simplicidade antes de otimização.
 - Primeiro foco: construção e inspeção da topologia; próxima fase (não implementada ainda) poderá incluir propagação direta, funções de ativação, erro e ajuste de pesos.
 
-## Estrutura de Arquivos
+## Estrutura de Arquivos (atualizada)
 ```
-neuron.py      -> Neuron: nó básico com bias e valores intermediários
-connection.py  -> Connection: ligação direcionada com peso entre dois neurônios
-layer.py       -> Layer: agrupamento de neurônios de mesma profundidade
-network.py     -> Network: orquestra camadas e gera conexões entre elas
-loader.py      -> Loader: simples carregador de dataset CSV (heart.csv)
-main.py        -> Exemplo mínimo de uso
-rsc/heart.csv  -> Dataset (13 features + alvo)
+neuron.py       -> Classe Neuron (bias, output, delta)
+connection.py   -> Conexões direcionadas (peso)
+layer.py        -> Agrupamento de neurônios
+network.py      -> Forward passo-a-passo, treino (backprop), registro de gradientes
+graph_utils.py  -> Geração de dados para visualização (posições, cores, espessuras)
+qt_viewer.py    -> Interface PyQt6 interativa (visualização + execução + treino)
+loader.py       -> Carregador CSV simples (usa última coluna como alvo)
+main.py         -> Exemplo mínimo (modo não-gráfico)
+rsc/heart.csv   -> Dataset de exemplo
 ```
 
 ## Classes
@@ -58,19 +60,66 @@ Isso indica que:
 - 1 neurônio na camada de saída
 - 13 conexões (cada neurônio de entrada ligado ao de saída)
 
-## Próximos Passos (Sugestões)
-- Implementar forward pass com função de ativação configurável (sigmoid, ReLU, etc.).
-- Incluir cálculo de erro e rascunho de backpropagation.
-- Suporte a inicialização customizada de pesos e biases.
-- Visualização (ex: exportar para formato DOT/Graphviz).
-- Separar claramente features e alvo no Loader (atualmente inferido de forma simples).
-- Persistir e recarregar pesos.
+## Interface Gráfica PyQt6
+A interface (`qt_viewer.py`) abre uma janela com:
+- Visualização da rede como grafo (nós = neurônios, arestas = pesos) com cores: azul (valores/pesos positivos), vermelho (negativos).
+- Labels de bias em cada neurônio, pesos nas arestas, valores de entrada à esquerda, nomes de features acima, saída à direita.
+- Zoom (scroll) e pan (arrastar). Highlight de neurônio atual no modo passo-a-passo.
 
-## Limitações Atuais
-- Sem treinamento ou ajustes de pesos.
-- Sem suporte a minibatches ou normalização.
-- Loader assume CSV bem formatado (não há validações robustas).
-- Não há testes automatizados ainda.
+### Controles Laterais
+1. Camadas / Neurônios: adicionar ou remover camadas internas e neurônios (exceto na camada de entrada ou de saída para camadas).*  
+2. Entrada: definir manualmente valores (separados por vírgula) antes de um forward.
+3. Ativação: escolher `identity`, `sigmoid` ou `relu` (requer reset para mudar se já iniciou forward).
+4. Dataset: carregar `heart.csv`, selecionar próximo sample, executar fast-forward em todas as amostras (mostra acurácia simples com threshold 0.5).
+5. Execução: `▶` (play automático passo-a-passo), `Passo`, `⏸`, `Reset`.
+6. Treino:
+	- Campo LR (learning rate).
+	- `Train Step`: faz um passo (forward + backprop) no sample atual (ou pega um sample do dataset se não houver seleção manual).
+	- `Train Época`: percorre todo o dataset acumulando loss médio e acurácia.
+	- `Ver Loss`: abre uma janela com histórico textual dos últimos 200 valores de loss.
+
+### Visualização de Gradientes
+Após qualquer passo de treino, as arestas são temporariamente recoloridas para representar o gradiente (dL/dw) da última atualização:
+- Verde: gradiente positivo
+- Magenta: gradiente negativo
+A intensidade da cor e espessura aumentada refletem a magnitude relativa (normalizada). Após ~1.2s a rede é redesenhada com as cores base atualizadas pelos novos pesos.
+
+### Forward Pass Passo-a-Passo
+O forward pode ser acompanhado neurônio a neurônio. O status mostra o valor de saída de cada neurônio processado e, ao final, a saída e (se disponível) o erro em relação ao alvo.
+
+### Treinamento
+O treinamento usa MSE (loss = 0.5 * (o - t)^2) com backpropagation para um único neurônio de saída. Cada `Train Step`:
+1. Executa forward completo.
+2. Calcula deltas (gradientes internos).
+3. Armazena gradientes por conexão (`network.last_gradients`).
+4. Atualiza pesos e biases.
+5. Atualiza visual e registra loss.
+
+`Train Época` repete este fluxo para todas as amostras do dataset.
+
+## Execução da Interface
+Instale dependências (apenas PyQt6 neste estágio):
+```
+pip install PyQt6
+```
+Depois execute:
+```
+python qt_viewer.py
+```
+
+## Limitacões Atuais
+- Saída única (backprop só cobre 1 neurônio de saída).
+- Sem normalização de dados.
+- Sem salvamento de pesos/estado.
+- Visualização de loss é textual (não gráfico de linhas ainda).
+
+## Próximos Passos (Sugestões)
+- Gráfico de loss em tempo real (matplotlib embutido ou QPainter customizado).
+- Suporte a múltiplos neurônios de saída / softmax.
+- Persistência (salvar/carregar pesos em JSON ou pickle).
+- Normalização / padronização de features.
+- Mini-batches e baralhamento de dados.
+- Exportar imagem da topologia / estados.
 
 ## Por Que Não Usar Matrizes Ainda?
 A representação explícita facilita a introdução de conceitos fundamentais sem exigir abstrações lineares mais compactas. Após assimilação conceitual, a transição para operações vetoriais (NumPy, etc.) torna-se mais natural.

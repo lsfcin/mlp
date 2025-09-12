@@ -23,6 +23,8 @@ class Network:
         self.dataset_inputs: List[List[float]] = []
         self.dataset_targets: List[float] = []
         self._dataset_index = 0
+        # gradientes da última atualização (por conexão id)
+        self.last_gradients = {}
 
     def _wire(self):
         self.connections.clear()
@@ -181,37 +183,29 @@ class Network:
         return x, y
 
     # ---- backpropagation ----
-    def backward(self, target: float):
-        """Calcula deltas e ajusta os pesos/bias (in-place) assumindo forward já executado.
-
-        Usa MSE: loss = 0.5 * (o - t)^2 ; d_loss/do = (o - t)
-        """
+    def _compute_deltas(self, target: float) -> float:
+        """Calcula deltas (gradientes de erro) sem atualizar pesos. Retorna erro bruto (o - target)."""
         if len(self.layers[-1]) != 1:
             raise NotImplementedError('backward atual suporta apenas 1 neurônio de saída')
         output_neuron = self.layers[-1].neurons[0]
         o = output_neuron.output
-        # derivada da ativação
-        act = self.activation_name
-        if act == 'sigmoid':
+        if self.activation_name == 'sigmoid':
             deriv_out = o * (1 - o)
-        elif act == 'relu':
+        elif self.activation_name == 'relu':
             deriv_out = 1.0 if output_neuron.input_sum > 0 else 0.0
-        else:  # identity
+        else:
             deriv_out = 1.0
-        error = o - target  # d_loss/do
+        error = o - target
         output_neuron.delta = error * deriv_out
-
-        # camadas ocultas (reversa)
-        for li in range(len(self.layers) - 2, 0, -1):  # da penúltima até a primeira oculta
+        # ocultas
+        for li in range(len(self.layers) - 2, 0, -1):
             layer = self.layers[li]
             next_layer = self.layers[li + 1]
             for neuron in layer.neurons:
-                # soma das contribuições das conexões de saída
                 s = 0.0
                 for c in self.connections:
                     if c.source is neuron and c.target in next_layer.neurons:
                         s += c.weight * c.target.delta
-                # derivada ativação
                 if self.activation_name == 'sigmoid':
                     deriv = neuron.output * (1 - neuron.output)
                 elif self.activation_name == 'relu':
@@ -219,21 +213,40 @@ class Network:
                 else:
                     deriv = 1.0
                 neuron.delta = s * deriv
+        return error
 
-        # atualizar pesos e biases
-        # (usar uma taxa default, ou exigir passada externa?) => taxa default: self.learning_rate se existir, senão 0.01
+    def backward(self, target: float):
+        """Executa passo de backprop completo (deltas + atualização de pesos). Retorna erro bruto."""
+        error = self._compute_deltas(target)
         lr = getattr(self, 'learning_rate', 0.01)
         for c in self.connections:
             c.weight -= lr * c.source.output * c.target.delta
-        for layer in self.layers[1:]:  # ignorar camada de entrada para bias
+        for layer in self.layers[1:]:
             for neuron in layer.neurons:
                 neuron.bias -= lr * neuron.delta
-        return error  # retornar erro bruto
+        return error
 
     def train_step(self, inputs: List[float], target: float, learning_rate: float = 0.01):
+        """Executa um passo de treino (forward + backprop) armazenando gradientes.
+
+        Retorna (outputs, erro_bruto, loss).
+        last_gradients: dict connection_id -> gradiente (dL/dw) ANTES da atualização.
+        """
         self.learning_rate = learning_rate
         outputs = self.forward_propagation(inputs)
-        error = self.backward(target)
+        error = self._compute_deltas(target)
+        # coletar gradientes antes de aplicar atualização
+        grads: Dict[str, float] = {}
+        for c in self.connections:
+            grads[c.id] = c.source.output * c.target.delta  # dL/dw
+        self.last_gradients = grads
+        # aplicar update
+        lr = self.learning_rate
+        for c in self.connections:
+            c.weight -= lr * grads[c.id]
+        for layer in self.layers[1:]:
+            for neuron in layer.neurons:
+                neuron.bias -= lr * neuron.delta  # grad bias = delta
         loss = 0.5 * (error ** 2)
         return outputs, error, loss
 
