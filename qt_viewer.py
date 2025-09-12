@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QLabel, QFrame, QMessageBox
 )
 from PyQt6.QtGui import QBrush, QPen, QColor, QTransform, QPainter
-from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtCore import Qt, QPointF, QTimer
 
 from network import Network
 from graph_utils import graph_data, add_layer, remove_layer
@@ -29,6 +29,18 @@ class GraphNodeItem(QGraphicsEllipseItem):
         self.label_item.setDefaultTextColor(QColor('#222222'))
         self.label_item.setPos(-self.label_item.boundingRect().width()/2, size/2 + 4)
         self.label_item.setParentItem(self)
+        self._base_brush = self.brush()
+        self._highlight = False
+
+    def highlight(self, on: bool):
+        if on == self._highlight:
+            return
+        self._highlight = on
+        if on:
+            b = QBrush(QColor('#ffff99'))
+            self.setBrush(b)
+        else:
+            self.setBrush(self._base_brush)
 
 
 class GraphEdgeItem(QGraphicsLineItem):
@@ -52,9 +64,15 @@ class GraphScene(QGraphicsScene):
     def __init__(self):
         super().__init__()
         self.setBackgroundBrush(QBrush(QColor('#ffffff')))
+        self.node_items: List[GraphNodeItem] = []
+        self._input_value_labels: List[QGraphicsTextItem] = []
+        self._output_value_label: Optional[QGraphicsTextItem] = None
 
     def build(self, network: Network):
         self.clear()
+        self.node_items.clear()
+        self._input_value_labels.clear()
+        self._output_value_label = None
         data = graph_data(network)
         nodes_index = {n['id']: n for n in data['nodes']}
         # edges
@@ -65,39 +83,39 @@ class GraphScene(QGraphicsScene):
             self.addItem(edge_item)
             self.addItem(edge_item.weight_label)
         # nodes
-        node_items = []
+        node_items_raw = []
         for n in data['nodes']:
             item = GraphNodeItem(n)
-            node_items.append((n, item))
+            node_items_raw.append((n, item))
+            self.node_items.append(item)
             self.addItem(item)
-        # labels de entrada (à esquerda) e nomes de features (acima)
-        if node_items:
-            input_layer_nodes = [pair for pair in node_items if pair[0]['layer'] == 0]
+        # labels de entrada e nomes de features
+        if node_items_raw:
+            input_layer_nodes = [pair for pair in node_items_raw if pair[0]['layer'] == 0]
             feature_names = self._default_feature_names(len(input_layer_nodes))
             for idx, (raw, item) in enumerate(input_layer_nodes):
-                # valores de entrada (placeholder 0)
                 left_label = QGraphicsTextItem("0")
                 left_label.setDefaultTextColor(QColor('#444444'))
                 br = left_label.boundingRect()
                 left_label.setPos(item.x() - item.rect().width()/2 - br.width() - 12, item.y() - br.height()/2)
                 self.addItem(left_label)
-                # nome da feature acima
+                self._input_value_labels.append(left_label)
                 feat_label = QGraphicsTextItem(feature_names[idx])
                 feat_label.setDefaultTextColor(QColor('#000000'))
                 fr = feat_label.boundingRect()
                 feat_label.setPos(item.x() - fr.width()/2, item.y() - item.rect().height()/2 - fr.height() - 6)
                 self.addItem(feat_label)
-        # label de saída (à direita do último nó)
-        output_layer_index = max(n['layer'] for n, _ in node_items) if node_items else 0
-        output_nodes = [pair for pair in node_items if pair[0]['layer'] == output_layer_index]
+        # label de saída
+        output_layer_index = max(n['layer'] for n, _ in node_items_raw) if node_items_raw else 0
+        output_nodes = [pair for pair in node_items_raw if pair[0]['layer'] == output_layer_index]
         if output_nodes:
-            # assumindo último nó (ou único)
             raw, item = output_nodes[-1]
             out_label = QGraphicsTextItem("0")
             out_label.setDefaultTextColor(QColor('#222222'))
             orc = out_label.boundingRect()
             out_label.setPos(item.x() + item.rect().width()/2 + 12, item.y() - orc.height()/2)
             self.addItem(out_label)
+            self._output_value_label = out_label
         self.setSceneRect(self.itemsBoundingRect().adjusted(-120, -120, 120, 120))
 
     def _default_feature_names(self, count: int) -> List[str]:
@@ -106,9 +124,32 @@ class GraphScene(QGraphicsScene):
         ]
         if count <= len(base):
             return base[:count]
-        # fallback gerar nomes extras
         extra = [f'f{i}' for i in range(len(base), count)]
         return base + extra
+
+    def highlight_neuron(self, layer_index: int, neuron_index: int, network: Network):
+        # remove highlight anterior
+        for item in self.node_items:
+            item.highlight(False)
+        # localizar neurônio alvo pelos índices
+        if not (0 <= layer_index < len(network.layers)):
+            return
+        layer = network.layers[layer_index]
+        if not (0 <= neuron_index < len(layer)):
+            return
+        target_id = layer.neurons[neuron_index].id
+        for item in self.node_items:
+            if getattr(item, 'node_id', None) == target_id:
+                item.highlight(True)
+                break
+
+    def update_input_values(self, values: List[float]):
+        for val, label in zip(values, self._input_value_labels):
+            label.setPlainText(f"{val:.2f}")
+
+    def update_output_value(self, value: float):
+        if self._output_value_label:
+            self._output_value_label.setPlainText(f"{value:.2f}")
 
 
 class GraphView(QGraphicsView):
@@ -133,6 +174,10 @@ class NetworkViewerWindow(QMainWindow):
         self.setWindowTitle('Visualizador de Rede Neural (PyQt)')
         self.scene = GraphScene()
         self.view = GraphView(self.scene)
+        self._forward_started = False
+        self._playing = False
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._on_play_tick)
         self._build_ui()
         self._refresh()
 
@@ -197,12 +242,16 @@ class NetworkViewerWindow(QMainWindow):
         # Playback controls (stubs)
         side.addWidget(self._section_label('Execução'))
         h_play = QHBoxLayout()
-        btn_play = QPushButton('▶')
-        btn_step = QPushButton('⏯ passo')
-        btn_pause = QPushButton('⏸')
-        btn_reset = QPushButton('Reset')
-        for b in (btn_play, btn_step, btn_pause, btn_reset):
+        self.btn_play = QPushButton('▶')
+        self.btn_step = QPushButton('Passo')
+        self.btn_pause = QPushButton('⏸')
+        self.btn_reset = QPushButton('Reset')
+        for b in (self.btn_play, self.btn_step, self.btn_pause, self.btn_reset):
             h_play.addWidget(b)
+        self.btn_play.clicked.connect(self._on_play)
+        self.btn_step.clicked.connect(self._on_step)
+        self.btn_pause.clicked.connect(self._on_pause)
+        self.btn_reset.clicked.connect(self._on_reset)
         side.addLayout(h_play)
 
         self.label_status = QLabel('Pronto')
@@ -225,6 +274,9 @@ class NetworkViewerWindow(QMainWindow):
     def _refresh(self):
         self.scene.build(self.network)
         self.label_status.setText(f"Camadas: {[len(l) for l in self.network.layers]}")
+        # se já havia forward iniciado, re-sincronizar inputs
+        if self._forward_started:
+            self.scene.update_input_values(self.network._fp_inputs)
 
     # Event handlers
     def _on_add_layer(self):
@@ -260,6 +312,65 @@ class NetworkViewerWindow(QMainWindow):
             self._refresh()
         except Exception as e:
             QMessageBox.warning(self, 'Erro', str(e))
+
+    # Forward control handlers
+    def _ensure_forward_started(self):
+        if not self._forward_started:
+            # gerar inputs simples (ex: zeros) tamanho camada entrada
+            inputs = [0.0 for _ in self.network.layers[0]]
+            self.network.start_forward(inputs)
+            self.scene.update_input_values(inputs)
+            self._forward_started = True
+            self.label_status.setText('Forward iniciado')
+
+    def _on_step(self):
+        self._ensure_forward_started()
+        status = self.network.forward_step()
+        kind = status[0]
+        if kind == 'neuron':
+            _, layer_i, neuron_i, value = status
+            self.scene.highlight_neuron(layer_i, neuron_i, self.network)
+            self.label_status.setText(f"Neuron ({layer_i},{neuron_i}) = {value:.4f}")
+            if layer_i == len(self.network.layers) - 1:
+                # atualizar saída parcial
+                self.scene.update_output_value(value)
+        elif kind == 'layer_done':
+            _, layer_i = status
+            self.label_status.setText(f"Camada {layer_i} concluída")
+        elif kind == 'done':
+            _, outputs = status
+            out_val = outputs[0] if outputs else 0.0
+            self.scene.update_output_value(out_val)
+            self.label_status.setText(f"Concluído. Output={out_val:.4f}")
+            self._playing = False
+            self._play_timer.stop()
+
+    def _on_play(self):
+        if self._playing:
+            return
+        self._ensure_forward_started()
+        self._playing = True
+        self._play_timer.start(300)  # ms
+        self.label_status.setText('Reproduzindo...')
+
+    def _on_play_tick(self):
+        if not self._playing:
+            return
+        self._on_step()
+
+    def _on_pause(self):
+        if self._playing:
+            self._playing = False
+            self._play_timer.stop()
+            self.label_status.setText('Pausado')
+
+    def _on_reset(self):
+        self._playing = False
+        self._play_timer.stop()
+        self.network.reset_state()
+        self._forward_started = False
+        self.scene.build(self.network)
+        self.label_status.setText('Reset')
 
 
 def launch_qt_viewer():
