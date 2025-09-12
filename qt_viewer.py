@@ -1,6 +1,6 @@
 from typing import Dict, Any, List, Optional
 from PyQt6.QtWidgets import (
-    QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem,
+    QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem,
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QSpinBox, QLabel, QFrame, QMessageBox
 )
@@ -13,16 +13,22 @@ from graph_utils import graph_data, add_layer, remove_layer
 
 class GraphNodeItem(QGraphicsEllipseItem):
     def __init__(self, node: Dict[str, Any]):
-        size = node['width'] * 4
+        size = node['width'] * 16.0  # 4x maior que antes
         super().__init__(-size/2, -size/2, size, size)
         self.node_id = node['id']
+        self.bias = node.get('bias', 0.0)
         self.setBrush(QBrush(QColor(node['color'])))
         pen = QPen(QColor(node['color']))
-        pen.setWidthF(max(1.0, node['width'] * 0.5))
+        pen.setWidthF(max(1.0, node['width']))
         self.setPen(pen)
-        self.setToolTip(node['label'])
+        self.setToolTip(f"bias={self.bias:.4f}")
         self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setPos(QPointF(node['x'], node['y']))
+        # label de bias abaixo
+        self.label_item = QGraphicsTextItem(f"{self.bias:.2f}")
+        self.label_item.setDefaultTextColor(QColor('#222222'))
+        self.label_item.setPos(-self.label_item.boundingRect().width()/2, size/2 + 4)
+        self.label_item.setParentItem(self)
 
 
 class GraphEdgeItem(QGraphicsLineItem):
@@ -33,6 +39,13 @@ class GraphEdgeItem(QGraphicsLineItem):
         self.setPen(pen)
         self.setToolTip(edge['label'])
         self.setZValue(-1)
+        # label de peso no meio
+        mx = (src['x'] + dst['x']) / 2.0
+        my = (src['y'] + dst['y']) / 2.0
+        self.weight_label = QGraphicsTextItem(f"{edge['weight']:.2f}")
+        self.weight_label.setDefaultTextColor(QColor('#111111'))
+        self.weight_label.setPos(mx, my)
+        self.weight_label.setZValue(10)
 
 
 class GraphScene(QGraphicsScene):
@@ -44,14 +57,58 @@ class GraphScene(QGraphicsScene):
         self.clear()
         data = graph_data(network)
         nodes_index = {n['id']: n for n in data['nodes']}
-        # edges first so nodes appear on top
+        # edges
         for e in data['edges']:
             src = nodes_index[e['source']]
             dst = nodes_index[e['target']]
-            self.addItem(GraphEdgeItem(src, dst, e))
+            edge_item = GraphEdgeItem(src, dst, e)
+            self.addItem(edge_item)
+            self.addItem(edge_item.weight_label)
+        # nodes
+        node_items = []
         for n in data['nodes']:
-            self.addItem(GraphNodeItem(n))
-        self.setSceneRect(self.itemsBoundingRect().adjusted(-80, -80, 80, 80))
+            item = GraphNodeItem(n)
+            node_items.append((n, item))
+            self.addItem(item)
+        # labels de entrada (à esquerda) e nomes de features (acima)
+        if node_items:
+            input_layer_nodes = [pair for pair in node_items if pair[0]['layer'] == 0]
+            feature_names = self._default_feature_names(len(input_layer_nodes))
+            for idx, (raw, item) in enumerate(input_layer_nodes):
+                # valores de entrada (placeholder 0)
+                left_label = QGraphicsTextItem("0")
+                left_label.setDefaultTextColor(QColor('#444444'))
+                br = left_label.boundingRect()
+                left_label.setPos(item.x() - item.rect().width()/2 - br.width() - 12, item.y() - br.height()/2)
+                self.addItem(left_label)
+                # nome da feature acima
+                feat_label = QGraphicsTextItem(feature_names[idx])
+                feat_label.setDefaultTextColor(QColor('#000000'))
+                fr = feat_label.boundingRect()
+                feat_label.setPos(item.x() - fr.width()/2, item.y() - item.rect().height()/2 - fr.height() - 6)
+                self.addItem(feat_label)
+        # label de saída (à direita do último nó)
+        output_layer_index = max(n['layer'] for n, _ in node_items) if node_items else 0
+        output_nodes = [pair for pair in node_items if pair[0]['layer'] == output_layer_index]
+        if output_nodes:
+            # assumindo último nó (ou único)
+            raw, item = output_nodes[-1]
+            out_label = QGraphicsTextItem("0")
+            out_label.setDefaultTextColor(QColor('#222222'))
+            orc = out_label.boundingRect()
+            out_label.setPos(item.x() + item.rect().width()/2 + 12, item.y() - orc.height()/2)
+            self.addItem(out_label)
+        self.setSceneRect(self.itemsBoundingRect().adjusted(-120, -120, 120, 120))
+
+    def _default_feature_names(self, count: int) -> List[str]:
+        base = [
+            'idade','sexo','cp','pressao','colesterol','acucar','ecg','freq','angina','oldpeak','slope','vessels','thal'
+        ]
+        if count <= len(base):
+            return base[:count]
+        # fallback gerar nomes extras
+        extra = [f'f{i}' for i in range(len(base), count)]
+        return base + extra
 
 
 class GraphView(QGraphicsView):
