@@ -1,14 +1,15 @@
 from typing import Dict, Any, List, Optional
 from PyQt6.QtWidgets import (
-    QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem,
+    QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem, QGraphicsPolygonItem,
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QSpinBox, QLabel, QFrame, QMessageBox
+    QSpinBox, QLabel, QFrame, QMessageBox, QLineEdit, QComboBox, QDoubleSpinBox
 )
-from PyQt6.QtGui import QBrush, QPen, QColor, QTransform, QPainter
+from PyQt6.QtGui import QBrush, QPen, QColor, QTransform, QPainter, QPolygonF
 from PyQt6.QtCore import Qt, QPointF, QTimer
 
 from network import Network
 from graph_utils import graph_data, add_layer, remove_layer
+from loader import Loader
 
 
 class GraphNodeItem(QGraphicsEllipseItem):
@@ -50,7 +51,7 @@ class GraphEdgeItem(QGraphicsLineItem):
         pen.setWidthF(max(0.5, edge['width']))
         self.setPen(pen)
         self.setToolTip(edge['label'])
-        self.setZValue(-1)
+        self.setZValue(-2)
         # label de peso no meio
         mx = (src['x'] + dst['x']) / 2.0
         my = (src['y'] + dst['y']) / 2.0
@@ -58,6 +59,27 @@ class GraphEdgeItem(QGraphicsLineItem):
         self.weight_label.setDefaultTextColor(QColor('#111111'))
         self.weight_label.setPos(mx, my)
         self.weight_label.setZValue(10)
+        # seta (triângulo) perto do destino
+        dx = dst['x'] - src['x']
+        dy = dst['y'] - src['y']
+        length = (dx**2 + dy**2) ** 0.5 or 1.0
+        ux, uy = dx / length, dy / length
+        arrow_size = 10
+        tip_x = dst['x'] - ux * 18
+        tip_y = dst['y'] - uy * 18
+        left_x = tip_x - uy * arrow_size/2 - ux * arrow_size
+        left_y = tip_y + ux * arrow_size/2 - uy * arrow_size
+        right_x = tip_x + uy * arrow_size/2 - ux * arrow_size
+        right_y = tip_y - ux * arrow_size/2 - uy * arrow_size
+        poly = QPolygonF([
+            QPointF(tip_x, tip_y),
+            QPointF(left_x, left_y),
+            QPointF(right_x, right_y)
+        ])
+        self.arrow_item = QGraphicsPolygonItem(poly)
+        self.arrow_item.setBrush(QBrush(QColor(edge['color'])))
+        self.arrow_item.setPen(QPen(Qt.PenStyle.NoPen))
+        self.arrow_item.setZValue(-1)
 
 
 class GraphScene(QGraphicsScene):
@@ -76,12 +98,15 @@ class GraphScene(QGraphicsScene):
         data = graph_data(network)
         nodes_index = {n['id']: n for n in data['nodes']}
         # edges
+        self.edge_items: List[GraphEdgeItem] = []
         for e in data['edges']:
             src = nodes_index[e['source']]
             dst = nodes_index[e['target']]
             edge_item = GraphEdgeItem(src, dst, e)
             self.addItem(edge_item)
             self.addItem(edge_item.weight_label)
+            self.addItem(edge_item.arrow_item)
+            self.edge_items.append(edge_item)
         # nodes
         node_items_raw = []
         for n in data['nodes']:
@@ -142,6 +167,20 @@ class GraphScene(QGraphicsScene):
             if getattr(item, 'node_id', None) == target_id:
                 item.highlight(True)
                 break
+        # highlight conexões de entrada
+        self.highlight_connections_to(neuron=layer.neurons[neuron_index], network=network)
+
+    def highlight_connections_to(self, neuron, network: Network):
+        # recolor tudo base
+        for e in self.edge_items:
+            pen = e.pen(); color = pen.color(); color.setAlpha(120); pen.setColor(color); e.setPen(pen)
+            e.arrow_item.setOpacity(0.25)
+        # obter conexões que chegam a este neurônio
+        for c in network._by_target.get(neuron.id, []):
+            for e in self.edge_items:
+                if hasattr(e, 'weight_label') and c.source.id in e.toolTip() and c.target.id in e.toolTip():
+                    pen = e.pen(); pen.setColor(QColor('#222222')); pen.setWidthF(pen.widthF()+1); e.setPen(pen)
+                    e.arrow_item.setOpacity(0.9)
 
     def update_input_values(self, values: List[float]):
         for val, label in zip(values, self._input_value_labels):
@@ -180,6 +219,8 @@ class NetworkViewerWindow(QMainWindow):
         self._play_timer.timeout.connect(self._on_play_tick)
         self._build_ui()
         self._refresh()
+        self._dataset_loaded = False
+        self._current_target = None
 
     def _build_ui(self):
         root = QWidget()
@@ -239,7 +280,42 @@ class NetworkViewerWindow(QMainWindow):
 
         side.addWidget(self._separator())
 
-        # Playback controls (stubs)
+        # Entrada customizada
+        side.addWidget(self._section_label('Entrada'))
+        h_input = QHBoxLayout()
+        self.edit_inputs = QLineEdit()
+        self.edit_inputs.setPlaceholderText('Ex: 0.1, -0.2, 1.0, ...')
+        h_input.addWidget(self.edit_inputs)
+        btn_set_inputs = QPushButton('Aplicar')
+        btn_set_inputs.clicked.connect(self._on_apply_inputs)
+        h_input.addWidget(btn_set_inputs)
+        side.addLayout(h_input)
+
+        # Ativação
+        h_act = QHBoxLayout()
+        h_act.addWidget(QLabel('Ativação'))
+        self.combo_activation = QComboBox()
+        self.combo_activation.addItems(['identity','sigmoid','relu'])
+        self.combo_activation.currentTextChanged.connect(self._on_change_activation)
+        h_act.addWidget(self.combo_activation)
+        side.addLayout(h_act)
+
+        # Dataset
+        side.addWidget(self._separator())
+        side.addWidget(self._section_label('Dataset'))
+        h_ds = QHBoxLayout()
+        self.btn_load_ds = QPushButton('Carregar heart.csv')
+        self.btn_load_ds.clicked.connect(self._on_load_dataset)
+        h_ds.addWidget(self.btn_load_ds)
+        self.btn_next_sample = QPushButton('Próximo sample')
+        self.btn_next_sample.clicked.connect(self._on_next_sample)
+        h_ds.addWidget(self.btn_next_sample)
+        side.addLayout(h_ds)
+        self.btn_fast_forward = QPushButton('Fast Forward (todas)')
+        self.btn_fast_forward.clicked.connect(self._on_fast_forward)
+        side.addWidget(self.btn_fast_forward)
+
+        side.addWidget(self._separator())
         side.addWidget(self._section_label('Execução'))
         h_play = QHBoxLayout()
         self.btn_play = QPushButton('▶')
@@ -256,6 +332,29 @@ class NetworkViewerWindow(QMainWindow):
 
         self.label_status = QLabel('Pronto')
         side.addWidget(self.label_status)
+
+        # Treino
+        side.addWidget(self._separator())
+        side.addWidget(self._section_label('Treino'))
+        h_lr = QHBoxLayout()
+        h_lr.addWidget(QLabel('LR'))
+        self.spin_lr = QDoubleSpinBox()
+        self.spin_lr.setDecimals(4)
+        self.spin_lr.setSingleStep(0.001)
+        self.spin_lr.setRange(0.0001, 10.0)
+        self.spin_lr.setValue(0.01)
+        h_lr.addWidget(self.spin_lr)
+        side.addLayout(h_lr)
+
+        h_train_btns = QHBoxLayout()
+        self.btn_train_step = QPushButton('Train Step')
+        self.btn_train_epoch = QPushButton('Train Época')
+        h_train_btns.addWidget(self.btn_train_step)
+        h_train_btns.addWidget(self.btn_train_epoch)
+        side.addLayout(h_train_btns)
+        self.btn_train_step.clicked.connect(self._on_train_step)
+        self.btn_train_epoch.clicked.connect(self._on_train_epoch)
+
         side.addStretch(1)
 
         self.setCentralWidget(root)
@@ -317,7 +416,14 @@ class NetworkViewerWindow(QMainWindow):
     def _ensure_forward_started(self):
         if not self._forward_started:
             # gerar inputs simples (ex: zeros) tamanho camada entrada
-            inputs = [0.0 for _ in self.network.layers[0]]
+            if self.edit_inputs.text().strip():
+                inputs = self._parse_inputs_text()
+            elif self._dataset_loaded:
+                x, y = self.network.next_dataset_sample()
+                inputs = x
+                self._current_target = y
+            else:
+                inputs = [0.0 for _ in self.network.layers[0]]
             self.network.start_forward(inputs)
             self.scene.update_input_values(inputs)
             self._forward_started = True
@@ -334,6 +440,8 @@ class NetworkViewerWindow(QMainWindow):
             if layer_i == len(self.network.layers) - 1:
                 # atualizar saída parcial
                 self.scene.update_output_value(value)
+            # atualizar cor do nó pela saída
+            self._update_node_colors()
         elif kind == 'layer_done':
             _, layer_i = status
             self.label_status.setText(f"Camada {layer_i} concluída")
@@ -341,9 +449,15 @@ class NetworkViewerWindow(QMainWindow):
             _, outputs = status
             out_val = outputs[0] if outputs else 0.0
             self.scene.update_output_value(out_val)
-            self.label_status.setText(f"Concluído. Output={out_val:.4f}")
+            # erro se target presente
+            if hasattr(self, '_current_target') and self._current_target is not None:
+                err = out_val - self._current_target
+                self.label_status.setText(f"Concluído. Output={out_val:.4f} Erro={err:.4f}")
+            else:
+                self.label_status.setText(f"Concluído. Output={out_val:.4f}")
             self._playing = False
             self._play_timer.stop()
+            self._update_node_colors()
 
     def _on_play(self):
         if self._playing:
@@ -371,6 +485,199 @@ class NetworkViewerWindow(QMainWindow):
         self._forward_started = False
         self.scene.build(self.network)
         self.label_status.setText('Reset')
+        self._current_target = None
+
+    # Dataset handlers
+    def _on_load_dataset(self):
+        try:
+            loader = Loader('rsc/heart.csv')
+            self.network.load_dataset_rows(loader.rows)
+            if self.network.dataset_inputs:
+                self._dataset_loaded = True
+                self.label_status.setText(f'Dataset carregado: {len(self.network.dataset_inputs)} samples')
+            else:
+                self.label_status.setText('Dataset vazio / inválido')
+        except Exception as e:
+            QMessageBox.warning(self, 'Erro', f'Falha ao carregar dataset: {e}')
+
+    def _on_next_sample(self):
+        if not self._dataset_loaded:
+            QMessageBox.information(self, 'Info', 'Carregue o dataset primeiro.')
+            return
+        if self._forward_started:
+            QMessageBox.information(self, 'Info', 'Reset antes de pegar novo sample.')
+            return
+        x, y = self.network.next_dataset_sample()
+        self.scene.update_input_values(x)
+        self.edit_inputs.setText(', '.join(f'{v:.3f}' for v in x))
+        self._current_target = y
+        self.label_status.setText('Sample pronto (target armazenado)')
+
+    def _on_fast_forward(self):
+        if not self._dataset_loaded:
+            QMessageBox.information(self, 'Info', 'Carregue o dataset primeiro.')
+            return
+        if self._forward_started:
+            QMessageBox.information(self, 'Info', 'Use Reset antes de fast-forward.')
+            return
+        total = len(self.network.dataset_inputs)
+        correct = 0
+        for x, target in zip(self.network.dataset_inputs, self.network.dataset_targets):
+            outputs = self.network.forward_propagation(x)
+            pred = outputs[0]
+            # classificação binária simples threshold 0.5 (para sigmoid/identity)
+            if (pred >= 0.5 and target >= 0.5) or (pred < 0.5 and target < 0.5):
+                correct += 1
+        acc = correct / total if total else 0.0
+        self.label_status.setText(f'FastForward concluído acc={acc:.3f}')
+
+    def _parse_inputs_text(self) -> List[float]:
+        txt = self.edit_inputs.text().strip()
+        if not txt:
+            return [0.0 for _ in self.network.layers[0]]
+        parts = [p.strip() for p in txt.replace(';', ',').split(',') if p.strip()]
+        vals = []
+        for p in parts:
+            try:
+                vals.append(float(p))
+            except ValueError:
+                raise ValueError(f"valor inválido: {p}")
+        if len(vals) != len(self.network.layers[0]):
+            raise ValueError(f"esperado {len(self.network.layers[0])} valores, recebido {len(vals)}")
+        return vals
+
+    def _on_apply_inputs(self):
+        if self._forward_started:
+            QMessageBox.information(self, 'Info', 'Reset antes de aplicar novos inputs.')
+            return
+        try:
+            vals = self._parse_inputs_text()
+            self.scene.update_input_values(vals)
+            self.label_status.setText('Inputs prontos')
+        except Exception as e:
+            QMessageBox.warning(self, 'Erro', str(e))
+
+    def _on_change_activation(self, name: str):
+        if self._forward_started:
+            QMessageBox.information(self, 'Info', 'Reset para mudar ativação.')
+            # reverter seleção para atual
+            idx = self.combo_activation.findText(self.network.activation_name)
+            self.combo_activation.blockSignals(True)
+            self.combo_activation.setCurrentIndex(idx)
+            self.combo_activation.blockSignals(False)
+            return
+        try:
+            self.network.set_activation(name)
+            self.label_status.setText(f'Ativação: {name}')
+        except Exception as e:
+            QMessageBox.warning(self, 'Erro', str(e))
+
+    def _update_node_colors(self):
+        # mapa id->output
+        outputs = {n.id: n.output for layer in self.network.layers for n in layer}
+        # função cor baseada em output
+        def out_color(v: float) -> QColor:
+            if abs(v) < 1e-9:
+                return QColor('#dddddd')
+            # azul para positivo, vermelho para negativo
+            ratio = min(1.0, abs(v))
+            if v >= 0:
+                r = int(70 - 50 * ratio)
+                g = int(160 - 80 * ratio)
+                b = int(240 - 120 * ratio)
+            else:
+                r = int(220 - 80 * (1 - ratio))
+                g = int(70 - 50 * (1 - ratio))
+                b = int(70 - 50 * (1 - ratio))
+            return QColor(r, g, b)
+        for item in self.scene.node_items:
+            vid = getattr(item, 'node_id', None)
+            if vid in outputs:
+                base_pen = item.pen()
+                item._base_brush = QBrush(out_color(outputs[vid]))
+                if not item._highlight:
+                    item.setBrush(item._base_brush)
+
+    # ================= Treino ====================
+    def _ensure_sample_for_training(self):
+        """Garantir que temos (inputs, target) para treino.
+        Se um sample já foi selecionado via dataset (self._current_target definido após _on_next_sample), usa-lo;
+        Caso contrário, se dataset carregado, pega próximo sample;
+        Se não houver dataset, tenta usar inputs customizados (sem target -> não treina) e aborta.
+        """
+        if self._dataset_loaded:
+            if self._current_target is None:
+                x, y = self.network.next_dataset_sample()
+                self._current_target = y
+                if not self.edit_inputs.text().strip():
+                    self.edit_inputs.setText(', '.join(f'{v:.3f}' for v in x))
+                self.scene.update_input_values(x)
+                return x, y
+            else:
+                # inputs atuais a partir da UI
+                try:
+                    x = self._parse_inputs_text()
+                except Exception:
+                    # se falhar parse, re-obter sample
+                    x, y = self.network.next_dataset_sample()
+                    self._current_target = y
+                    self.edit_inputs.setText(', '.join(f'{v:.3f}' for v in x))
+                    self.scene.update_input_values(x)
+                    return x, y
+                return x, self._current_target
+        else:
+            # sem dataset
+            if not self.edit_inputs.text().strip():
+                QMessageBox.information(self, 'Info', 'Forneça inputs ou carregue dataset para treinar.')
+                return None
+            try:
+                x = self._parse_inputs_text()
+            except Exception as e:
+                QMessageBox.warning(self, 'Erro', f'Inputs inválidos: {e}')
+                return None
+            QMessageBox.information(self, 'Info', 'Sem target (dataset). Não é possível calcular erro/backprop.')
+            return None
+
+    def _after_weight_update_refresh(self):
+        # reconstruir cena para atualizar labels de pesos / setas / biases
+        self.scene.build(self.network)
+        # recolor outputs conforme estado atual
+        self._update_node_colors()
+
+    def _on_train_step(self):
+        if self._forward_started:
+            QMessageBox.information(self, 'Info', 'Use Reset antes de treinar (forward em andamento).')
+            return
+        sample = self._ensure_sample_for_training()
+        if sample is None:
+            return
+        x, target = sample
+        lr = float(self.spin_lr.value())
+        outputs, error, loss = self.network.train_step(x, target, lr)
+        self._after_weight_update_refresh()
+        self.label_status.setText(f'TrainStep out={outputs[0]:.4f} target={target:.4f} erro={error:.4f} loss={loss:.5f}')
+
+    def _on_train_epoch(self):
+        if not self._dataset_loaded:
+            QMessageBox.information(self, 'Info', 'Carregue o dataset antes.')
+            return
+        if self._forward_started:
+            QMessageBox.information(self, 'Info', 'Use Reset antes de treinar (forward em andamento).')
+            return
+        lr = float(self.spin_lr.value())
+        total_loss = 0.0
+        correct = 0
+        total = len(self.network.dataset_inputs)
+        for x, target in zip(self.network.dataset_inputs, self.network.dataset_targets):
+            outputs, error, loss = self.network.train_step(x, target, lr)
+            total_loss += loss
+            pred = outputs[0]
+            if (pred >= 0.5 and target >= 0.5) or (pred < 0.5 and target < 0.5):
+                correct += 1
+        avg_loss = total_loss / total if total else 0.0
+        acc = correct / total if total else 0.0
+        self._after_weight_update_refresh()
+        self.label_status.setText(f'Época: loss_med={avg_loss:.5f} acc={acc:.3f}')
 
 
 def launch_qt_viewer():

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Callable, Dict
 from neuron import Neuron
 from layer import Layer
 from connection import Connection
@@ -10,11 +10,19 @@ class Network:
             raise ValueError("at least input and output")
         self.layers: List[Layer] = [Layer(s) for s in layer_sizes]
         self.connections: List[Connection] = []
+        # ativação e índice de conexões precisam existir antes do _wire()
+        self.activation_name = 'identity'
+        self._activation_fn: Callable[[float], float] = lambda x: x
+        self._by_target: Dict[str, List[Connection]] = {}
         self._wire()
         # estado para execução passo-a-passo
         self._fp_layer_index = 0
         self._fp_neuron_index = 0
         self._fp_inputs: List[float] = []
+        # dataset (opcional) para treino/iteração
+        self.dataset_inputs: List[List[float]] = []
+        self.dataset_targets: List[float] = []
+        self._dataset_index = 0
 
     def _wire(self):
         self.connections.clear()
@@ -24,6 +32,12 @@ class Network:
             for n1 in a:
                 for n2 in b:
                     self.connections.append(Connection(n1, n2))
+        self._rebuild_connection_index()
+
+    def _rebuild_connection_index(self):
+        self._by_target.clear()
+        for c in self.connections:
+            self._by_target.setdefault(c.target.id, []).append(c)
 
     def add_neuron(self, layer_index: int) -> Neuron:
         if not 0 <= layer_index < len(self.layers):
@@ -110,13 +124,12 @@ class Network:
             # somar entradas vindas da camada anterior
             prev = self.layers[self._fp_layer_index - 1]
             total = 0.0
-            for c in self.connections:
-                if c.target is neuron and c.source in prev.neurons:
-                    total += c.source.output * c.weight
+            for c in self._by_target.get(neuron.id, []):
+                # como a rede é feed-forward estrito, basta acumular
+                total += c.source.output * c.weight
             total += neuron.bias
             neuron.input_sum = total
-            # ativação simples (identidade por enquanto, pode trocar depois)
-            neuron.output = total
+            neuron.output = self._activation_fn(total)
             result = ('neuron', self._fp_layer_index, self._fp_neuron_index, neuron.output)
             self._fp_neuron_index += 1
             # se terminou a camada, prepara próximo retorno layer_done
@@ -141,3 +154,99 @@ class Network:
             status = self.forward_step()
             if status[0] == 'done':
                 return status[1]
+
+    # ---- dataset helpers ----
+    def load_dataset_rows(self, rows: List[List[str]]):
+        self.dataset_inputs.clear()
+        self.dataset_targets.clear()
+        for r in rows:
+            if len(r) < len(self.layers[0]) + 1:
+                continue
+            *features, target = r
+            try:
+                x = [float(v) for v in features[:len(self.layers[0])]]
+                y = float(target)
+            except ValueError:
+                continue
+            self.dataset_inputs.append(x)
+            self.dataset_targets.append(y)
+        self._dataset_index = 0
+
+    def next_dataset_sample(self):
+        if not self.dataset_inputs:
+            raise RuntimeError('dataset vazio')
+        x = self.dataset_inputs[self._dataset_index]
+        y = self.dataset_targets[self._dataset_index]
+        self._dataset_index = (self._dataset_index + 1) % len(self.dataset_inputs)
+        return x, y
+
+    # ---- backpropagation ----
+    def backward(self, target: float):
+        """Calcula deltas e ajusta os pesos/bias (in-place) assumindo forward já executado.
+
+        Usa MSE: loss = 0.5 * (o - t)^2 ; d_loss/do = (o - t)
+        """
+        if len(self.layers[-1]) != 1:
+            raise NotImplementedError('backward atual suporta apenas 1 neurônio de saída')
+        output_neuron = self.layers[-1].neurons[0]
+        o = output_neuron.output
+        # derivada da ativação
+        act = self.activation_name
+        if act == 'sigmoid':
+            deriv_out = o * (1 - o)
+        elif act == 'relu':
+            deriv_out = 1.0 if output_neuron.input_sum > 0 else 0.0
+        else:  # identity
+            deriv_out = 1.0
+        error = o - target  # d_loss/do
+        output_neuron.delta = error * deriv_out
+
+        # camadas ocultas (reversa)
+        for li in range(len(self.layers) - 2, 0, -1):  # da penúltima até a primeira oculta
+            layer = self.layers[li]
+            next_layer = self.layers[li + 1]
+            for neuron in layer.neurons:
+                # soma das contribuições das conexões de saída
+                s = 0.0
+                for c in self.connections:
+                    if c.source is neuron and c.target in next_layer.neurons:
+                        s += c.weight * c.target.delta
+                # derivada ativação
+                if self.activation_name == 'sigmoid':
+                    deriv = neuron.output * (1 - neuron.output)
+                elif self.activation_name == 'relu':
+                    deriv = 1.0 if neuron.input_sum > 0 else 0.0
+                else:
+                    deriv = 1.0
+                neuron.delta = s * deriv
+
+        # atualizar pesos e biases
+        # (usar uma taxa default, ou exigir passada externa?) => taxa default: self.learning_rate se existir, senão 0.01
+        lr = getattr(self, 'learning_rate', 0.01)
+        for c in self.connections:
+            c.weight -= lr * c.source.output * c.target.delta
+        for layer in self.layers[1:]:  # ignorar camada de entrada para bias
+            for neuron in layer.neurons:
+                neuron.bias -= lr * neuron.delta
+        return error  # retornar erro bruto
+
+    def train_step(self, inputs: List[float], target: float, learning_rate: float = 0.01):
+        self.learning_rate = learning_rate
+        outputs = self.forward_propagation(inputs)
+        error = self.backward(target)
+        loss = 0.5 * (error ** 2)
+        return outputs, error, loss
+
+    # ---- ativação ----
+    def set_activation(self, name: str):
+        name = name.lower()
+        if name == 'identity':
+            self._activation_fn = lambda x: x
+        elif name == 'sigmoid':
+            import math
+            self._activation_fn = lambda x: 1.0 / (1.0 + math.exp(-x))
+        elif name == 'relu':
+            self._activation_fn = lambda x: x if x > 0 else 0.0
+        else:
+            raise ValueError('unknown activation')
+        self.activation_name = name
