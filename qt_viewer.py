@@ -60,6 +60,7 @@ class GraphEdgeItem(QGraphicsLineItem):
         self.weight_label.setDefaultTextColor(QColor('#111111'))
         self.weight_label.setPos(mx, my)
         self.weight_label.setZValue(10)
+        self.weight_label.setVisible(False)
         # seta (triângulo) perto do destino
         dx = dst['x'] - src['x']
         dy = dst['y'] - src['y']
@@ -81,6 +82,18 @@ class GraphEdgeItem(QGraphicsLineItem):
         self.arrow_item.setBrush(QBrush(QColor(edge['color'])))
         self.arrow_item.setPen(QPen(Qt.PenStyle.NoPen))
         self.arrow_item.setZValue(-1)
+        # hover events
+        self.setAcceptHoverEvents(True)
+
+    def hoverEnterEvent(self, event):
+        if hasattr(self, 'weight_label'):
+            self.weight_label.setVisible(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        if hasattr(self, 'weight_label'):
+            self.weight_label.setVisible(False)
+        super().hoverLeaveEvent(event)
 
 
 class GraphScene(QGraphicsScene):
@@ -207,6 +220,45 @@ class GraphView(QGraphicsView):
             self.scale(1 / self.scale_factor, 1 / self.scale_factor)
 
 
+class LossChartWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.history: List[float] = []
+        self.setMinimumHeight(120)
+
+    def set_history(self, values: List[float]):
+        self.history = list(values)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor('#fafafa'))
+        if not self.history:
+            painter.end()
+            return
+        w = self.width(); h = self.height()
+        margin = 8
+        chart_w = max(1, w - 2*margin)
+        chart_h = max(1, h - 2*margin)
+        min_v = min(self.history)
+        max_v = max(self.history)
+        rng = max(1e-9, (max_v - min_v))
+        pen_axis = QPen(QColor('#cccccc'))
+        painter.setPen(pen_axis)
+        painter.drawRect(margin, margin, chart_w, chart_h)
+        pen_line = QPen(QColor('#0070f3'))
+        pen_line.setWidth(2)
+        painter.setPen(pen_line)
+        n = len(self.history)
+        for i in range(1, n):
+            x1 = margin + (i-1) * chart_w / max(1, n-1)
+            y1 = margin + chart_h - ((self.history[i-1] - min_v) / rng) * chart_h
+            x2 = margin + i * chart_w / max(1, n-1)
+            y2 = margin + chart_h - ((self.history[i] - min_v) / rng) * chart_h
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        painter.end()
+
+
 class NetworkViewerWindow(QMainWindow):
     def __init__(self, network: Network):
         super().__init__()
@@ -318,6 +370,26 @@ class NetworkViewerWindow(QMainWindow):
         self.btn_fast_forward.clicked.connect(self._on_fast_forward)
         side.addWidget(self.btn_fast_forward)
 
+        # Pré-processamento
+        h_prep = QHBoxLayout()
+        h_prep.addWidget(QLabel('Pré-processamento'))
+        self.combo_prep = QComboBox()
+        self.combo_prep.addItems(['none', 'normalize', 'standardize'])
+        self.combo_prep.setCurrentText(getattr(self.network, 'preprocess_mode', 'none'))
+        self.combo_pep_current_changed = self.combo_prep.currentTextChanged.connect(self._on_change_prep)
+        h_prep.addWidget(self.combo_prep)
+        side.addLayout(h_prep)
+
+        # Persistência
+        h_persist = QHBoxLayout()
+        self.btn_save = QPushButton('Salvar JSON')
+        self.btn_save.clicked.connect(self._on_save_weights)
+        self.btn_load = QPushButton('Carregar JSON')
+        self.btn_load.clicked.connect(self._on_load_weights)
+        h_persist.addWidget(self.btn_save)
+        h_persist.addWidget(self.btn_load)
+        side.addLayout(h_persist)
+
         side.addWidget(self._separator())
         side.addWidget(self._section_label('Execução'))
         h_play = QHBoxLayout()
@@ -361,6 +433,9 @@ class NetworkViewerWindow(QMainWindow):
         self.btn_show_loss = QPushButton('Ver Loss')
         self.btn_show_loss.clicked.connect(self._on_show_loss)
         side.addWidget(self.btn_show_loss)
+        # Gráfico inline de Loss
+        self.loss_chart = LossChartWidget()
+        side.addWidget(self.loss_chart)
         side.addStretch(1)
         self.setCentralWidget(root)
 
@@ -700,6 +775,8 @@ class NetworkViewerWindow(QMainWindow):
         outputs, error, loss = self.network.train_step(x, target, lr)
         self._record_loss(loss)
         self._after_weight_update_refresh()
+        # atualizar labels de entrada conforme inputs efetivamente usados (já transformados internamente)
+        self.scene.update_input_values(self.network.transform_inputs(x))
         self.label_status.setText(f'TrainStep out={outputs[0]:.4f} target={target:.4f} erro={error:.4f} loss={loss:.5f}')
 
     def _on_train_epoch(self):
@@ -720,10 +797,50 @@ class NetworkViewerWindow(QMainWindow):
             if (pred >= 0.5 and target >= 0.5) or (pred < 0.5 and target < 0.5):
                 correct += 1
             self._record_loss(loss)
+        # atualizar labels de entrada com o último x transformado
+        if self.network.dataset_inputs:
+            self.scene.update_input_values(self.network.transform_inputs(self.network.dataset_inputs[-1]))
         avg_loss = total_loss / total if total else 0.0
         acc = correct / total if total else 0.0
         self._after_weight_update_refresh()
         self.label_status.setText(f'Época: loss_med={avg_loss:.5f} acc={acc:.3f}')
+
+    def _on_change_prep(self, name: str):
+        if self._forward_started:
+            QMessageBox.information(self, 'Info', 'Reset para mudar pré-processamento.')
+            idx = self.combo_prep.findText(getattr(self.network, 'preprocess_mode', 'none'))
+            self.combo_prep.blockSignals(True)
+            if idx >= 0:
+                self.combo_prep.setCurrentIndex(idx)
+            self.combo_prep.blockSignals(False)
+            return
+        try:
+            self.network.set_preprocess_mode(name)
+            self.label_status.setText(f'Pré-processamento: {name}')
+            # atualizar labels de entrada se houver texto atual
+            if self.edit_inputs.text().strip():
+                try:
+                    raw = self._parse_inputs_text()
+                    self.scene.update_input_values(self.network.transform_inputs(raw))
+                except Exception:
+                    pass
+        except Exception as e:
+            QMessageBox.warning(self, 'Erro', str(e))
+
+    def _on_save_weights(self):
+        try:
+            self.network.save_json('weights.json')
+            QMessageBox.information(self, 'Info', 'Pesos salvos em weights.json')
+        except Exception as e:
+            QMessageBox.warning(self, 'Erro', f'Falha ao salvar: {e}')
+
+    def _on_load_weights(self):
+        try:
+            self.network.load_json('weights.json')
+            self._refresh()
+            QMessageBox.information(self, 'Info', 'Pesos carregados de weights.json')
+        except Exception as e:
+            QMessageBox.warning(self, 'Erro', f'Falha ao carregar: {e}')
 
     # ===== Loss History Window =====
     def _ensure_loss_window(self):
@@ -742,6 +859,8 @@ class NetworkViewerWindow(QMainWindow):
             self._loss_history = self._loss_history[-200:]
         if self._loss_window and self._loss_window.isVisible():
             self._update_loss_text()
+        if hasattr(self, 'loss_chart') and self.loss_chart is not None:
+            self.loss_chart.set_history(self._loss_history)
 
     def _update_loss_text(self):
         if not hasattr(self, 'loss_text'):

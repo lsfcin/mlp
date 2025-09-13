@@ -1,4 +1,6 @@
-from typing import List, Callable, Dict
+from typing import List, Callable, Dict, Optional
+import random
+import json
 from neuron import Neuron
 from layer import Layer
 from connection import Connection
@@ -25,6 +27,12 @@ class Network:
         self._dataset_index = 0
         # gradientes da última atualização (por conexão id)
         self.last_gradients = {}
+        # preprocessamento
+        self.preprocess_mode = 'none'  # 'none' | 'normalize' | 'standardize'
+        self._feat_min: List[float] = []
+        self._feat_max: List[float] = []
+        self._feat_mean: List[float] = []
+        self._feat_std: List[float] = []
 
     def _wire(self):
         self.connections.clear()
@@ -78,7 +86,8 @@ class Network:
         return f"Network({self.summary()})"
 
     # -------- forward propagation --------
-    def reset_state(self):
+    def reset_forward_state(self):
+        """Reseta apenas o estado de execução do forward (sem tocar em pesos/biases)."""
         for layer in self.layers:
             for n in layer:
                 n.input_sum = 0.0
@@ -88,10 +97,24 @@ class Network:
         self._fp_neuron_index = 0
         self._fp_inputs = []
 
+    def reset_state(self):
+        """Reset completo: estado de forward + re-inicialização de pesos e vieses."""
+        self.reset_forward_state()
+        # também resetar pesos e vieses conforme solicitado
+        self._randomize_parameters()
+
+    def _randomize_parameters(self):
+        for c in self.connections:
+            c.weight = random.uniform(-1.0, 1.0)
+        for layer in self.layers[1:]:  # ignorar camada de entrada
+            for n in layer:
+                n.bias = 0.0
+
     def start_forward(self, inputs: List[float]):
         if len(inputs) != len(self.layers[0]):
             raise ValueError("input size mismatch")
-        self.reset_state()
+        # não randomizar pesos ao iniciar um forward; apenas limpar estado
+        self.reset_forward_state()
         self._fp_inputs = list(inputs)
         # define outputs diretamente na camada de entrada
         for val, neuron in zip(inputs, self.layers[0]):
@@ -173,14 +196,56 @@ class Network:
             self.dataset_inputs.append(x)
             self.dataset_targets.append(y)
         self._dataset_index = 0
+        # calcular estatísticas para preprocessamento
+        d = len(self.layers[0])
+        if self.dataset_inputs:
+            cols = list(zip(*self.dataset_inputs))
+            self._feat_min = [min(col) for col in cols]
+            self._feat_max = [max(col) for col in cols]
+            self._feat_mean = [sum(col) / len(col) for col in cols]
+            self._feat_std = []
+            for i, col in enumerate(cols):
+                m = self._feat_mean[i]
+                var = sum((v - m) ** 2 for v in col) / max(1, (len(col)))
+                std = var ** 0.5
+                if std < 1e-12:
+                    std = 1.0
+                self._feat_std.append(std)
 
     def next_dataset_sample(self):
         if not self.dataset_inputs:
             raise RuntimeError('dataset vazio')
-        x = self.dataset_inputs[self._dataset_index]
+        x = self.transform_inputs(self.dataset_inputs[self._dataset_index])
         y = self.dataset_targets[self._dataset_index]
         self._dataset_index = (self._dataset_index + 1) % len(self.dataset_inputs)
         return x, y
+
+    # ---- preprocessamento ----
+    def set_preprocess_mode(self, mode: str):
+        mode = mode.lower()
+        if mode not in ('none', 'normalize', 'standardize'):
+            raise ValueError('modo inválido de preprocessamento')
+        self.preprocess_mode = mode
+
+    def transform_inputs(self, inputs: List[float]) -> List[float]:
+        if self.preprocess_mode == 'none':
+            return list(inputs)
+        if not self._feat_min or len(self._feat_min) != len(inputs):
+            return list(inputs)
+        out = []
+        if self.preprocess_mode == 'normalize':
+            for v, mn, mx in zip(inputs, self._feat_min, self._feat_max):
+                rng = mx - mn
+                if abs(rng) < 1e-12:
+                    out.append(0.0)
+                else:
+                    out.append((v - mn) / rng)
+        elif self.preprocess_mode == 'standardize':
+            for v, m, s in zip(inputs, self._feat_mean, self._feat_std):
+                out.append((v - m) / (s if s else 1.0))
+        else:
+            out = list(inputs)
+        return out
 
     # ---- backpropagation ----
     def _compute_deltas(self, target: float) -> float:
@@ -233,7 +298,7 @@ class Network:
         last_gradients: dict connection_id -> gradiente (dL/dw) ANTES da atualização.
         """
         self.learning_rate = learning_rate
-        outputs = self.forward_propagation(inputs)
+        outputs = self.forward_propagation(self.transform_inputs(inputs))
         error = self._compute_deltas(target)
         # coletar gradientes antes de aplicar atualização
         grads: Dict[str, float] = {}
@@ -263,3 +328,68 @@ class Network:
         else:
             raise ValueError('unknown activation')
         self.activation_name = name
+
+    # ---- persistência ----
+    def to_dict(self) -> Dict:
+        sizes = [len(l) for l in self.layers]
+        data: Dict[str, Optional[Dict]] = {
+            'layers': sizes,
+            'activation': self.activation_name,
+            'biases': {},
+            'weights': {},
+        }
+        for li in range(1, len(self.layers)):
+            # biases da camada li
+            data['biases'][str(li)] = [n.bias for n in self.layers[li].neurons]
+            # pesos da conexão layer li-1 -> li
+            prev = self.layers[li - 1]
+            cur = self.layers[li]
+            mat: List[List[float]] = []
+            for pj, pn in enumerate(prev.neurons):
+                row = []
+                for cj, cn in enumerate(cur.neurons):
+                    # achar conexão pn -> cn
+                    w = 0.0
+                    for c in self.connections:
+                        if c.source is pn and c.target is cn:
+                            w = c.weight
+                            break
+                    row.append(w)
+                mat.append(row)
+            data['weights'][str(li)] = mat
+        return data
+
+    def save_json(self, path: str):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    def load_json(self, path: str):
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        sizes = data.get('layers')
+        if sizes and sizes != [len(l) for l in self.layers]:
+            # reconstruir rede para bater os tamanhos
+            self.layers = [Layer(s) for s in sizes]
+            self._wire()
+        # aplicar biases e pesos
+        for li in range(1, len(self.layers)):
+            # biases
+            b_list = data.get('biases', {}).get(str(li))
+            if b_list and len(b_list) == len(self.layers[li]):
+                for n, b in zip(self.layers[li].neurons, b_list):
+                    n.bias = float(b)
+            # pesos
+            mat = data.get('weights', {}).get(str(li))
+            if mat:
+                prev = self.layers[li - 1]
+                cur = self.layers[li]
+                for pj, pn in enumerate(prev.neurons):
+                    for cj, cn in enumerate(cur.neurons):
+                        val = float(mat[pj][cj])
+                        for c in self.connections:
+                            if c.source is pn and c.target is cn:
+                                c.weight = val
+                                break
+        act = data.get('activation')
+        if act:
+            self.set_activation(act)
